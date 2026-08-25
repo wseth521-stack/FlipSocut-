@@ -2485,36 +2485,43 @@ def scan_nellis_web(location, category="", subcategory="", star_rating="", max_l
 
 def normalize_nellis_market(location):
     """
-    Current Nellis shopping markets and accepted pickup-city clusters.
+    Nellis shopping markets represented as pickup clusters.
     Returns (market_name_for_url, expected_state, accepted_pickup_cities).
     """
     raw = (location or "").strip()
     key = raw.lower()
 
     markets = {
-        # Arizona market
+        # Arizona market can legitimately include both Phoenix and Mesa pickups.
+        "arizona": ("Phoenix", "AZ", {"phoenix", "mesa"}),
+        "arizona (phoenix + mesa)": ("Phoenix", "AZ", {"phoenix", "mesa"}),
         "phoenix": ("Phoenix", "AZ", {"phoenix", "mesa"}),
         "phoenix, az": ("Phoenix", "AZ", {"phoenix", "mesa"}),
         "mesa": ("Phoenix", "AZ", {"phoenix", "mesa"}),
         "mesa, az": ("Phoenix", "AZ", {"phoenix", "mesa"}),
 
-        # Nevada market
+        # Nevada market cluster.
+        "nevada": ("Las Vegas", "NV", {"las vegas", "north las vegas", "henderson"}),
+        "nevada (las vegas area)": ("Las Vegas", "NV", {"las vegas", "north las vegas", "henderson"}),
         "las vegas": ("Las Vegas", "NV", {"las vegas", "north las vegas", "henderson"}),
         "las vegas, nv": ("Las Vegas", "NV", {"las vegas", "north las vegas", "henderson"}),
 
-        # Texas markets
+        # Texas market clusters.
         "houston": ("Houston", "TX", {"houston", "katy"}),
         "houston, tx": ("Houston", "TX", {"houston", "katy"}),
-        "dallas": ("Dallas", "TX", {"dallas"}),
-        "dallas, tx": ("Dallas", "TX", {"dallas"}),
+        "houston area": ("Houston", "TX", {"houston", "katy"}),
 
-        # Pennsylvania market
+        "dallas": ("Dallas", "TX", {"dallas", "fort worth", "arlington", "irving"}),
+        "dallas, tx": ("Dallas", "TX", {"dallas", "fort worth", "arlington", "irving"}),
+        "dallas / fort worth": ("Dallas", "TX", {"dallas", "fort worth", "arlington", "irving"}),
+
+        # Pennsylvania.
         "philadelphia": ("Philadelphia", "PA", {"philadelphia"}),
         "philadelphia, pa": ("Philadelphia", "PA", {"philadelphia"}),
 
-        # Colorado market
-        "denver": ("Denver", "CO", {"denver"}),
-        "denver, co": ("Denver", "CO", {"denver"}),
+        # Colorado.
+        "denver": ("Denver", "CO", {"denver", "aurora"}),
+        "denver, co": ("Denver", "CO", {"denver", "aurora"}),
     }
 
     if key in markets:
@@ -2528,12 +2535,12 @@ def normalize_nellis_market(location):
 
 
 NELLIS_MARKET_OPTIONS = [
-    "Phoenix, AZ",
-    "Las Vegas, NV",
-    "Houston, TX",
+    "Arizona (Phoenix + Mesa)",
+    "Nevada (Las Vegas Area)",
+    "Houston Area",
+    "Dallas / Fort Worth",
     "Philadelphia, PA",
     "Denver, CO",
-    "Dallas, TX",
 ]
 
 def _nellis_search_url(location, category="", subcategory="", star_rating=""):
@@ -2564,75 +2571,56 @@ def _nellis_search_url(location, category="", subcategory="", star_rating=""):
 
 def listing_matches_selected_market(row, location):
     """
-    Hard location gate. A listing must match the selected market before FlipScout can show it.
+    Hard location gate using a market cluster rather than one city.
+    Accepts any legitimate pickup city in the selected Nellis market.
     """
-    market_name, expected_state, accepted_cities = normalize_nellis_market(location)
+    _, expected_state, accepted_cities = normalize_nellis_market(location)
 
-    city = str(
+    raw_city = str(
         row.get("pickupCity")
         or row.get("city")
         or row.get("shoppingLocation")
+        or row.get("pickupAddress")
         or ""
-    ).strip().lower()
+    ).strip()
 
-    state = str(
+    raw_state = str(
         row.get("pickupState")
         or row.get("state")
         or ""
     ).strip().upper()
 
-    # Reject an explicit wrong state immediately.
-    if expected_state and state and state != expected_state:
+    city_text = raw_city.lower()
+
+    # Extract state from a combined location/address string if needed.
+    if not raw_state and expected_state:
+        if re.search(rf"\b{re.escape(expected_state)}\b", raw_city, flags=re.I):
+            raw_state = expected_state
+
+    # Explicit wrong state is always rejected.
+    if expected_state and raw_state and raw_state != expected_state:
         return False
 
-    # If city is explicit, it must belong to the selected market cluster.
-    if city and accepted_cities:
-        # Some parsers expose strings like "Phoenix, AZ" in city/location.
-        city_only = city.split(",")[0].strip()
-        if city_only not in accepted_cities:
-            return False
+    # Any accepted pickup city appearing in the combined location string is positive evidence.
+    city_match = any(
+        re.search(rf"\b{re.escape(city)}\b", city_text, flags=re.I)
+        for city in accepted_cities
+    ) if accepted_cities else False
 
-    # Require at least some positive location evidence.
-    if expected_state and state == expected_state:
+    # Strong positive match.
+    if expected_state and raw_state == expected_state and city_match:
         return True
-    if city and accepted_cities and city.split(",")[0].strip() in accepted_cities:
+
+    # Some Nellis pages expose only city or only state.
+    if city_match and not raw_state:
+        return True
+    if expected_state and raw_state == expected_state and not city_text:
         return True
 
     return False
 
 
-def _nellis_market_url_candidates(location, category="", subcategory="", star_rating=""):
-    """Try Nellis market URL forms defensively; Nellis has changed market routing over time."""
-    from urllib.parse import urlencode
-    market_name, state, _ = normalize_nellis_market(location)
-    full = f"{market_name}, {state}" if state else market_name
-    base_filters = []
-    if star_rating:
-        rating = str(star_rating).replace(" Stars", "").replace(" Star", "").strip()
-        if rating and rating.lower() != "any":
-            base_filters.append(("Star Rating", rating if "." in rating else rating + ".0"))
-    if category:
-        base_filters.append(("Taxonomy Level 1", category))
-    if subcategory:
-        base_filters.append(("Taxonomy Level 2", subcategory))
-
-    variants = [
-        [("Location Name", full)],
-        [("Location Name", market_name)],
-        [("location", full)],
-        [("Location", full)],
-        [("market", full)],
-    ]
-    urls=[]
-    for loc_params in variants:
-        u="https://www.nellisauction.com/search?" + urlencode(loc_params + base_filters)
-        if u not in urls:
-            urls.append(u)
-    return urls
-
-
-
-def discover_product_links_from_sitemaps(session, max_candidates=500):
+def discover_product_links_from_sitemaps(session, max_candidates=2500):
     """
     Lightweight fallback that discovers Nellis product URLs from sitemap/robots
     without launching a browser. This avoids being locked to the default Vegas search page.
@@ -2663,7 +2651,7 @@ def discover_product_links_from_sitemaps(session, max_candidates=500):
     seen_sitemaps = set()
     queue = list(sitemap_urls)
 
-    while queue and len(seen_sitemaps) < 15 and len(product_urls) < max_candidates:
+    while queue and len(seen_sitemaps) < 60 and len(product_urls) < max_candidates:
         sm = queue.pop(0)
         if sm in seen_sitemaps:
             continue
@@ -2743,7 +2731,7 @@ def scan_nellis_lightweight(location, category="", subcategory="", star_rating="
     })
 
     search_url = _nellis_search_url(location, category, subcategory, star_rating)
-    status(f"Loading {location} inventory…")
+    status(f"Loading Nellis inventory for {location}…")
 
     direct_links = []
     try:
@@ -2777,9 +2765,9 @@ def scan_nellis_lightweight(location, category="", subcategory="", star_rating="
 
     sitemap_candidates = []
     if len(candidates) < int(max_links):
-        status("Finding more Nellis inventory across all markets…")
+        status(f"Searching Nellis inventory for the {location} pickup cluster…")
         sitemap_candidates = discover_product_links_from_sitemaps(
-            session, max_candidates=max(500, int(max_links) * 5)
+            session, max_candidates=max(2500, int(max_links) * 25)
         )
         for u in sitemap_candidates:
             if u not in candidates:
@@ -2830,7 +2818,7 @@ def scan_nellis_lightweight(location, category="", subcategory="", star_rating="
             progress_callback(done, target, location)
 
         # Keep free-host scans bounded.
-        if checked >= max(700, target * 7):
+        if checked >= max(2200, target * 22):
             break
 
     if progress_callback:
@@ -2897,15 +2885,15 @@ min_profit = st.sidebar.number_input(
 )
 
 st.markdown("## Choose Nellis Inventory")
-st.caption("Choose any Nellis market below. FlipScout verifies every listing's pickup location before showing it.")
+st.caption("Choose a Nellis market cluster below. FlipScout accepts every legitimate pickup city in that market and rejects listings from other states/markets.")
 
 c1, c2 = st.columns(2)
 with c1:
     location = st.selectbox(
-        "Nellis location",
+        "Nellis market",
         NELLIS_MARKET_OPTIONS,
         index=0,
-        help="Choose the Nellis shopping market you want FlipScout to scan."
+        help="Choose a market cluster. FlipScout accepts all legitimate pickup cities inside that Nellis market."
     )
 with c2:
     star_rating = st.selectbox(
@@ -2975,7 +2963,7 @@ if scan:
         rows = result["rows"]
         if not rows:
             st.warning(
-                f"No verified listings matched {result.get('scan_location') or location}. "
+                f"No verified listings matched the {result.get('scan_location') or location} market cluster. "
                 "FlipScout rejected any inventory from other Nellis markets. "
                 "Try broader category/condition filters if this market is correct."
             )
@@ -3121,4 +3109,4 @@ if scan:
                     )
 
 st.divider()
-st.caption("FlipScout AI Web v4.6")
+st.caption("FlipScout AI Web v4.7")
