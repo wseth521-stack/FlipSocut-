@@ -1,14 +1,16 @@
-# FlipScout AI Web v4.1
+# FlipScout AI Web v4.2 — Lightweight Render Edition
 
-Render troubleshooting release.
+This build removes Chromium from the active Nellis scan path.
 
-Changes:
-- Explicit /usr/bin/chromium and /usr/bin/chromedriver paths.
-- 25-second page-load timeout.
-- 15-second script timeout.
-- Server scan stage messages visible in the website.
-- Streamlit file watcher disabled.
-- Browser always closes after a scan.
-- No expand/full-screen results feature.
+Why:
+Render Free provides 512 MB RAM. The prior Streamlit + Chromium/Selenium process exceeded that limit and was killed with status 137.
 
-Upload these files over the existing GitHub files and commit to main. Render can then deploy the latest commit.
+v4.2:
+- Uses normal HTTP requests instead of launching Chromium.
+- Keeps the FlipScout UI, deal settings, profit analysis, and results workflow.
+- Has bounded network timeouts.
+- Runs on Render's Free plan for testing.
+- Does not include the broken expand/full-screen feature.
+
+Important:
+Nellis may serve some inventory dynamically. If its public search HTML does not expose listing URLs to ordinary HTTP requests, FlipScout will report zero links rather than crash the server. That result will tell us whether the next step should use Nellis's underlying public data requests/API instead.

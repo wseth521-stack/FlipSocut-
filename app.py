@@ -2487,6 +2487,96 @@ def scan_nellis_web(location, category="", subcategory="", star_rating="", max_l
             except Exception:
                 pass
 
+
+def _nellis_search_url(location, category="", subcategory="", star_rating=""):
+    """Build a Nellis search URL without launching Chrome."""
+    from urllib.parse import urlencode
+    params = {}
+    if location:
+        params["Location"] = f"Name={location}"
+    if star_rating:
+        rating = str(star_rating).replace(" Stars", "").replace(" Star", "")
+        params["StarRating"] = rating
+    if category:
+        params["Taxonomy:Level1"] = category
+    if subcategory:
+        params["Taxonomy:Level2"] = subcategory
+    return "https://www.nellisauction.com/search?" + urlencode(params)
+
+def scan_nellis_lightweight(location, category="", subcategory="", star_rating="", max_links=100,
+                             progress_callback=None, status_callback=None):
+    """Low-memory scanner: HTTP only. No Chromium/Selenium process."""
+    def status(msg):
+        if status_callback:
+            status_callback(msg)
+
+    status("Connecting to Nellis without launching Chrome…")
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    })
+
+    search_url = _nellis_search_url(location, category, subcategory, star_rating)
+    status(f"Loading filtered Nellis inventory for {location}…")
+    resp = session.get(search_url, timeout=(8, 20))
+    resp.raise_for_status()
+    html = resp.text
+
+    # Extract product URLs from server-rendered HTML / embedded JSON.
+    patterns = [
+        r'https://www\.nellisauction\.com/p/[^"\'<>\s\\]+',
+        r'href=["\'](/p/[^"\']+)["\']',
+        r'["\'](?:itemUrl|url)["\']\s*:\s*["\']([^"\']*/p/[^"\']+)["\']',
+    ]
+    found = []
+    for pat in patterns:
+        for m in re.findall(pat, html, flags=re.I):
+            u = m if isinstance(m, str) else m[0]
+            u = u.replace("\\u0026", "&").replace("\\/", "/")
+            if u.startswith("/"):
+                u = "https://www.nellisauction.com" + u
+            if u.startswith("https://www.nellisauction.com/p/") and u not in found:
+                found.append(u)
+            if len(found) >= int(max_links):
+                break
+        if len(found) >= int(max_links):
+            break
+
+    links = found[:int(max_links)]
+    total = len(links)
+    status(f"Found {total} listing links. Reading item details…")
+    if progress_callback:
+        progress_callback(0, total, location)
+
+    rows, ended, errors = [], [], []
+    for i, u in enumerate(links, 1):
+        try:
+            r = session.get(u, timeout=(6, 15))
+            r.raise_for_status()
+            visible = re.sub(r"<script\b[^>]*>.*?</script>", " ", r.text, flags=re.I|re.S)
+            visible = re.sub(r"<style\b[^>]*>.*?</style>", " ", visible, flags=re.I|re.S)
+            visible = re.sub(r"<[^>]+>", " ", visible)
+            visible = re.sub(r"\s+", " ", visible)
+            row = _parse_nellis_page_source(u, r.text, visible_text=visible)
+            row["scanLocation"] = location
+            if listing_is_active(row):
+                rows.append(row)
+            else:
+                ended.append(row)
+        except Exception as e:
+            errors.append({"itemUrl": u, "error": str(e)[:160]})
+        if progress_callback:
+            progress_callback(i, total, location)
+
+    return {
+        "rows": rows, "ended": ended, "errors": errors,
+        "links_found": total, "scan_location": location,
+        "search_url": search_url,
+    }
+
 # ---------- FlipScout Web v4.0 UI ----------
 st.set_page_config(
     page_title="FlipScout AI",
@@ -2593,7 +2683,7 @@ if scan:
             progress_text.caption(f"{done} of {total} listings checked")
 
         try:
-            result = scan_nellis_web(
+            result = scan_nellis_lightweight(
                 location=location.strip(),
                 category=category.strip(),
                 subcategory=subcategory.strip(),
@@ -2758,4 +2848,4 @@ if scan:
                     )
 
 st.divider()
-st.caption("FlipScout AI Web v4.1")
+st.caption("FlipScout AI Web v4.2")
