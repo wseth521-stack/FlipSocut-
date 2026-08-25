@@ -2706,14 +2706,194 @@ def row_matches_requested_filters(row, category="", subcategory="", star_rating=
 
     return True
 
+
+def _absolute_url(base, src):
+    from urllib.parse import urljoin
+    return urljoin(base, src)
+
+
+def discover_nellis_algolia_config(session):
+    """
+    Discover Nellis's public Algolia client configuration from Nellis's own
+    search page and JavaScript bundles.
+    """
+    base = "https://www.nellisauction.com/search"
+    r = session.get(base, timeout=(8, 20))
+    r.raise_for_status()
+    html = r.text
+    sources = [html]
+
+    script_srcs = re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', html, flags=re.I)
+    for src in script_srcs[:35]:
+        try:
+            js_url = _absolute_url(base, src)
+            jr = session.get(js_url, timeout=(5, 15))
+            if jr.ok and len(jr.text) < 8_000_000:
+                sources.append(jr.text)
+        except Exception:
+            continue
+
+    blob = "\n".join(sources)
+
+    app_patterns = [
+        r'["\']applicationId["\']\s*:\s*["\']([A-Z0-9]{6,})["\']',
+        r'["\']appId["\']\s*:\s*["\']([A-Z0-9]{6,})["\']',
+        r'applicationId\s*[:=]\s*["\']([A-Z0-9]{6,})["\']',
+    ]
+    key_patterns = [
+        r'["\']apiKey["\']\s*:\s*["\']([A-Za-z0-9_\-]{20,})["\']',
+        r'apiKey\s*[:=]\s*["\']([A-Za-z0-9_\-]{20,})["\']',
+        r'X-Algolia-API-Key["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-]{20,})["\']',
+    ]
+    index_patterns = [
+        r'["\']indexName["\']\s*:\s*["\']([^"\']{3,120})["\']',
+        r'indexName\s*[:=]\s*["\']([^"\']{3,120})["\']',
+    ]
+
+    def first_match(patterns):
+        for pat in patterns:
+            m = re.search(pat, blob, flags=re.I)
+            if m:
+                return m.group(1)
+        return None
+
+    app_id = first_match(app_patterns)
+    api_key = first_match(key_patterns)
+    indices = []
+    for pat in index_patterns:
+        for val in re.findall(pat, blob, flags=re.I):
+            val = str(val).strip()
+            if val and val not in indices and " " not in val and len(val) <= 120:
+                indices.append(val)
+
+    # Extra likely index strings from minified bundles.
+    for val in re.findall(r'["\']([A-Za-z0-9_\-]*(?:product|auction|item)[A-Za-z0-9_\-]*)["\']', blob, flags=re.I):
+        if 3 <= len(val) <= 100 and val not in indices:
+            indices.append(val)
+
+    if not app_id or not api_key:
+        raise RuntimeError("Nellis search configuration could not be discovered.")
+
+    return {"app_id": app_id, "api_key": api_key, "indices": indices[:30]}
+
+
+def _algolia_query(session, app_id, api_key, index_name, payload):
+    url = f"https://{app_id.lower()}-dsn.algolia.net/1/indexes/{index_name}/query"
+    headers = {
+        "X-Algolia-Application-Id": app_id,
+        "X-Algolia-API-Key": api_key,
+        "Content-Type": "application/json",
+    }
+    r = session.post(url, headers=headers, json=payload, timeout=(8, 20))
+    if not r.ok:
+        return None
+    try:
+        return r.json()
+    except Exception:
+        return None
+
+
+def _flatten_hit_text(hit):
+    vals = []
+    def walk(v):
+        if isinstance(v, dict):
+            for vv in v.values():
+                walk(vv)
+        elif isinstance(v, list):
+            for vv in v:
+                walk(vv)
+        elif v is not None:
+            vals.append(str(v))
+    walk(hit)
+    return " | ".join(vals)
+
+
+def _hit_product_url(hit):
+    for key in ["itemUrl", "url", "productUrl", "href", "path"]:
+        v = hit.get(key)
+        if not v:
+            continue
+        v = str(v).replace("\\/", "/")
+        if "/p/" in v:
+            if v.startswith("http"):
+                return v
+            if v.startswith("/"):
+                return "https://www.nellisauction.com" + v
+
+    text = _flatten_hit_text(hit)
+    m = re.search(r'https?://(?:www\.)?nellisauction\.com/p/[^\s|"\'<>]+', text, flags=re.I)
+    if m:
+        return m.group(0)
+    m = re.search(r'(/p/[A-Za-z0-9%_\-./]+)', text)
+    if m:
+        return "https://www.nellisauction.com" + m.group(1)
+    return None
+
+
+def discover_algolia_product_links(session, max_links=100, status_callback=None):
+    """
+    Use Nellis's own public search index to discover product URLs across markets.
+    Exact pickup verification happens later on the Nellis item page.
+    """
+    def status(msg):
+        if status_callback:
+            status_callback(msg)
+
+    status("Connecting to Nellis inventory search…")
+    cfg = discover_nellis_algolia_config(session)
+
+    viable = None
+    for idx in cfg["indices"]:
+        data = _algolia_query(
+            session, cfg["app_id"], cfg["api_key"], idx,
+            {"query": "", "hitsPerPage": 100, "page": 0, "attributesToRetrieve": ["*"]}
+        )
+        if not data or not isinstance(data.get("hits"), list):
+            continue
+        links = []
+        for hit in data["hits"]:
+            if isinstance(hit, dict):
+                u = _hit_product_url(hit)
+                if u and u not in links:
+                    links.append(u)
+        if links:
+            viable = (idx, links, int(data.get("nbHits", len(links)) or len(links)))
+            break
+
+    if viable is None:
+        raise RuntimeError("Nellis search index connected, but no product inventory was readable.")
+
+    index_name, links, nb_hits = viable
+    status("Nellis inventory index connected. Loading listings…")
+
+    page = 1
+    # Pull a broad pool because pickup city is verified on each item page.
+    wanted_pool = max(800, int(max_links) * 10)
+    while len(links) < wanted_pool and page < 20:
+        data = _algolia_query(
+            session, cfg["app_id"], cfg["api_key"], index_name,
+            {"query": "", "hitsPerPage": 100, "page": page, "attributesToRetrieve": ["*"]}
+        )
+        if not data or not data.get("hits"):
+            break
+        added = 0
+        for hit in data["hits"]:
+            if isinstance(hit, dict):
+                u = _hit_product_url(hit)
+                if u and u not in links:
+                    links.append(u)
+                    added += 1
+        if added == 0:
+            break
+        page += 1
+
+    return {"links": links, "index_name": index_name, "nb_hits": nb_hits}
+
 def scan_nellis_lightweight(location, category="", subcategory="", star_rating="", max_links=100,
                              progress_callback=None, status_callback=None):
     """
-    Render-free multi-market scan:
-    1) Try Nellis search HTML first.
-    2) Hard-verify pickup market.
-    3) If the search page falls back to the wrong/default market, discover product
-       URLs from Nellis sitemaps and stop when enough verified listings are found.
+    v4.9: Nellis search-index discovery + exact pickup verification.
+    No browser process is launched.
     """
     def status(msg):
         if status_callback:
@@ -2727,65 +2907,28 @@ def scan_nellis_lightweight(location, category="", subcategory="", star_rating="
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     })
 
-    search_url = _nellis_search_url(location, category, subcategory, star_rating)
-    status(f"Loading Nellis inventory for {location}…")
-
-    direct_links = []
-    try:
-        resp = session.get(search_url, timeout=(8, 20))
-        resp.raise_for_status()
-        html = resp.text
-
-        patterns = [
-            r'https://www\.nellisauction\.com/p/[^"\'<>\s\\]+',
-            r'href=["\'](/p/[^"\']+)["\']',
-            r'["\'](?:itemUrl|url)["\']\s*:\s*["\']([^"\']*/p/[^"\']+)["\']',
-        ]
-        for pat in patterns:
-            for m in re.findall(pat, html, flags=re.I):
-                u = m if isinstance(m, str) else m[0]
-                u = u.replace("\\u0026", "&").replace("\\/", "/")
-                if u.startswith("/"):
-                    u = "https://www.nellisauction.com" + u
-                if u.startswith("https://www.nellisauction.com/p/") and u not in direct_links:
-                    direct_links.append(u)
-                if len(direct_links) >= int(max_links):
-                    break
-            if len(direct_links) >= int(max_links):
-                break
-    except Exception:
-        pass
-
-    # Candidate pool begins with direct search results, then sitemap fallback.
-    candidates = list(direct_links)
-    status("Verifying pickup market…")
-
-    sitemap_candidates = []
-    if len(candidates) < int(max_links):
-        status(f"Searching Nellis inventory for pickup at {location}…")
-        sitemap_candidates = discover_product_links_from_sitemaps(
-            session, max_candidates=max(2500, int(max_links) * 25)
-        )
-        for u in sitemap_candidates:
-            if u not in candidates:
-                candidates.append(u)
+    discovery = discover_algolia_product_links(
+        session, max_links=int(max_links), status_callback=status_callback
+    )
+    candidates = discovery["links"]
 
     rows, ended, errors = [], [], []
     checked = 0
     target = int(max_links)
-    total_candidates = len(candidates)
 
     if progress_callback:
-        progress_callback(0, max(1, min(total_candidates, target)), location)
+        progress_callback(0, target, location)
+
+    status(f"Verifying exact pickup location: {location}…")
 
     for u in candidates:
         if len(rows) >= target:
             break
-
         checked += 1
         try:
             r = session.get(u, timeout=(5, 12))
-            r.raise_for_status()
+            if not r.ok:
+                continue
 
             visible = re.sub(r"<script\b[^>]*>.*?</script>", " ", r.text, flags=re.I|re.S)
             visible = re.sub(r"<style\b[^>]*>.*?</style>", " ", visible, flags=re.I|re.S)
@@ -2797,7 +2940,6 @@ def scan_nellis_lightweight(location, category="", subcategory="", star_rating="
 
             if not listing_matches_selected_market(row, location):
                 continue
-
             if not row_matches_requested_filters(row, category, subcategory, star_rating):
                 continue
 
@@ -2807,19 +2949,16 @@ def scan_nellis_lightweight(location, category="", subcategory="", star_rating="
                 ended.append(row)
 
         except Exception as e:
-            errors.append({"itemUrl": u, "error": str(e)[:160]})
+            errors.append({"itemUrl": u, "error": str(e)[:180]})
 
         if progress_callback:
-            # Progress is based on verified matches when fallback candidate pool is large.
-            done = min(len(rows), target)
-            progress_callback(done, target, location)
+            progress_callback(min(len(rows), target), target, location)
 
-        # Keep free-host scans bounded.
-        if checked >= max(2200, target * 22):
+        if checked >= max(1000, target * 10):
             break
 
     if progress_callback:
-        progress_callback(target if rows else 0, target, location)
+        progress_callback(len(rows), target, location)
 
     return {
         "rows": rows,
@@ -2827,9 +2966,8 @@ def scan_nellis_lightweight(location, category="", subcategory="", star_rating="
         "errors": errors,
         "links_found": checked,
         "scan_location": location,
-        "search_url": search_url,
-        "direct_links_found": len(direct_links),
-        "fallback_links_found": len(sitemap_candidates),
+        "index_name": discovery.get("index_name", ""),
+        "index_hits": discovery.get("nb_hits", 0),
     }
 
 # ---------- FlipScout Web v4.0 UI ----------
@@ -2882,7 +3020,7 @@ min_profit = st.sidebar.number_input(
 )
 
 st.markdown("## Choose Nellis Inventory")
-st.caption("Choose the exact Nellis pickup location below. FlipScout only shows listings verified for that pickup city.")
+st.caption("Choose the exact Nellis pickup location. FlipScout searches Nellis inventory first, then verifies each listing's pickup city.")
 
 c1, c2 = st.columns(2)
 with c1:
@@ -2912,7 +3050,7 @@ with c4:
     )
 
 with st.expander("Advanced scan settings"):
-    st.caption("FlipScout verifies every listing against the exact pickup location selected.")
+    st.caption("v4.9 discovers inventory from Nellis's search index and then verifies the exact pickup location.")
     max_links = st.number_input(
         "Maximum listings to inspect",
         min_value=10,
@@ -2955,7 +3093,7 @@ if scan:
 
         scan_status.success("Nellis scan finished.")
         progress.progress(100, text="Scan complete — 100%")
-        progress_text.caption(f"{result['links_found']} listings checked")
+        progress_text.caption(f"{result['links_found']} Nellis listings inspected for {location}")
 
         rows = result["rows"]
         if not rows:
@@ -3106,4 +3244,4 @@ if scan:
                     )
 
 st.divider()
-st.caption("FlipScout AI Web v4.8")
+st.caption("FlipScout AI Web v4.9")

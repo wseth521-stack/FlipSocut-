@@ -1,30 +1,15 @@
-# FlipScout AI Web v4.8 — Exact Pickup Locations
+# FlipScout AI Web v4.9 — Nellis Inventory Index
 
-v4.8 separates individual Nellis pickup locations instead of combining nearby warehouses into one market choice.
+v4.9 replaces the old generic 100-listing discovery path.
 
-Pickup selector includes:
-- Phoenix, AZ
-- Mesa, AZ
-- Las Vegas, NV
-- North Las Vegas, NV
-- Henderson, NV
-- Houston, TX
-- Katy, TX
-- Dallas, TX
-- Fort Worth, TX
-- Arlington, TX
-- Irving, TX
-- Philadelphia, PA
-- Denver, CO
-- Aurora, CO
+It now:
+- discovers Nellis's public Algolia client configuration from Nellis's own site;
+- uses Nellis's public search index to collect a broad pool of product listing URLs;
+- verifies the exact selected pickup location from each Nellis product page;
+- keeps Phoenix and Mesa separate;
+- keeps the other pickup cities separate;
+- applies optional category/subcategory/star filters only after pickup verification;
+- uses HTTP requests only, with no Selenium/Chromium active scan;
+- remains suitable for Render Free testing.
 
-Behavior:
-- Selecting Phoenix only accepts Phoenix pickup listings.
-- Selecting Mesa only accepts Mesa pickup listings.
-- The same exact-pickup rule applies to Nevada, Texas, Colorado, and other multi-pickup markets.
-- Wrong pickup cities and wrong states are rejected.
-- Category placeholder now reads "Example: Electronics".
-- Subcategory placeholder now reads "Example: Computers, Laptops, Tablets & Accessories".
-- Placeholder examples disappear naturally when the user types and do not count as filters.
-- Lightweight HTTP-only scan remains in place for Render Free testing.
-- Footer updated to v4.8.
+If Nellis changes its search configuration, FlipScout now returns a clear search-index error rather than silently scanning Las Vegas inventory.
