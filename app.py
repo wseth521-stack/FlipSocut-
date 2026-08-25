@@ -2487,20 +2487,99 @@ def scan_nellis_web(location, category="", subcategory="", star_rating="", max_l
                 pass
 
 
+def normalize_nellis_market(location):
+    """
+    Convert friendly location labels to the value Nellis uses in its URL.
+    Returns (market_name_for_url, expected_state, accepted_pickup_cities).
+    """
+    raw = (location or "").strip()
+    key = raw.lower()
+
+    markets = {
+        "phoenix": ("Phoenix", "AZ", {"phoenix", "mesa"}),
+        "phoenix, az": ("Phoenix", "AZ", {"phoenix", "mesa"}),
+        "mesa": ("Mesa", "AZ", {"mesa", "phoenix"}),
+        "mesa, az": ("Mesa", "AZ", {"mesa", "phoenix"}),
+        "las vegas": ("Las Vegas", "NV", {"las vegas", "north las vegas", "henderson"}),
+        "las vegas, nv": ("Las Vegas", "NV", {"las vegas", "north las vegas", "henderson"}),
+        "philadelphia": ("Philadelphia", "PA", {"philadelphia"}),
+        "philadelphia, pa": ("Philadelphia", "PA", {"philadelphia"}),
+    }
+
+    if key in markets:
+        return markets[key]
+
+    # Generic fallback for future Nellis markets.
+    if "," in raw:
+        city, state = [x.strip() for x in raw.rsplit(",", 1)]
+        return city, state.upper(), {city.lower()}
+    return raw, "", {raw.lower()} if raw else set()
+
+
 def _nellis_search_url(location, category="", subcategory="", star_rating=""):
-    """Build a Nellis search URL without launching Chrome."""
+    """Build the same style of search URL Nellis produces in the browser."""
     from urllib.parse import urlencode
-    params = {}
-    if location:
-        params["Location"] = f"Name={location}"
+
+    market_name, _, _ = normalize_nellis_market(location)
+
+    params = []
     if star_rating:
-        rating = str(star_rating).replace(" Stars", "").replace(" Star", "")
-        params["StarRating"] = rating
+        rating = str(star_rating).replace(" Stars", "").replace(" Star", "").strip()
+        if rating and rating.lower() != "any":
+            if "." not in rating:
+                rating = rating + ".0"
+            params.append(("Star Rating", rating))
+
+    if market_name:
+        params.append(("Location Name", market_name))
+
     if category:
-        params["Taxonomy:Level1"] = category
+        params.append(("Taxonomy Level 1", category))
+
     if subcategory:
-        params["Taxonomy:Level2"] = subcategory
+        params.append(("Taxonomy Level 2", subcategory))
+
     return "https://www.nellisauction.com/search?" + urlencode(params)
+
+
+def listing_matches_selected_market(row, location):
+    """
+    Hard location gate. A listing must match the selected market before FlipScout can show it.
+    """
+    market_name, expected_state, accepted_cities = normalize_nellis_market(location)
+
+    city = str(
+        row.get("pickupCity")
+        or row.get("city")
+        or row.get("shoppingLocation")
+        or ""
+    ).strip().lower()
+
+    state = str(
+        row.get("pickupState")
+        or row.get("state")
+        or ""
+    ).strip().upper()
+
+    # Reject an explicit wrong state immediately.
+    if expected_state and state and state != expected_state:
+        return False
+
+    # If city is explicit, it must belong to the selected market cluster.
+    if city and accepted_cities:
+        # Some parsers expose strings like "Phoenix, AZ" in city/location.
+        city_only = city.split(",")[0].strip()
+        if city_only not in accepted_cities:
+            return False
+
+    # Require at least some positive location evidence.
+    if expected_state and state == expected_state:
+        return True
+    if city and accepted_cities and city.split(",")[0].strip() in accepted_cities:
+        return True
+
+    return False
+
 
 def scan_nellis_lightweight(location, category="", subcategory="", star_rating="", max_links=100,
                              progress_callback=None, status_callback=None):
@@ -2561,7 +2640,13 @@ def scan_nellis_lightweight(location, category="", subcategory="", star_rating="
             visible = re.sub(r"\s+", " ", visible)
             row = _parse_nellis_page_source(u, r.text, visible_text=visible)
             row["scanLocation"] = location
-            if listing_is_active(row):
+
+            if not listing_matches_selected_market(row, location):
+                errors.append({
+                    "itemUrl": u,
+                    "error": f"Rejected wrong pickup market for selected location: {location}"
+                })
+            elif listing_is_active(row):
                 rows.append(row)
             else:
                 ended.append(row)
@@ -2655,6 +2740,7 @@ with c4:
     )
 
 with st.expander("Advanced scan settings"):
+    st.caption("FlipScout will use Nellis-style URL parameters and verify every listing's pickup market.")
     max_links = st.number_input(
         "Maximum listings to inspect",
         min_value=10,
@@ -2702,8 +2788,9 @@ if scan:
         rows = result["rows"]
         if not rows:
             st.warning(
-                f"No active listings were found for {result.get('scan_location') or location}. "
-                "Try broader filters or verify the location/category wording."
+                f"No verified listings matched {result.get('scan_location') or location}. "
+                "FlipScout rejected any inventory from other Nellis markets. "
+                "Try broader category/condition filters if this market is correct."
             )
         else:
             live = standardize(pd.DataFrame(rows))
@@ -2847,4 +2934,4 @@ if scan:
                     )
 
 st.divider()
-st.caption("FlipScout AI Web v4.2")
+st.caption("FlipScout AI Web v4.4")

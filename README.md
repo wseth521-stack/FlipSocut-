@@ -1,20 +1,21 @@
-# FlipScout AI Web v4.3 — Lightweight Render Edition
+# FlipScout AI Web v4.4 — Location Authority Fix
 
-This build removes Chromium from the active Nellis scan path.
+This version keeps the lightweight Render-safe scanner and fixes cross-market inventory.
 
-Why:
-Render Free provides 512 MB RAM. The prior Streamlit + Chromium/Selenium process exceeded that limit and was killed with status 137.
+Changes:
+- Uses the same Nellis query parameter names seen in browser URLs:
+  - Location Name
+  - Star Rating
+  - Taxonomy Level 1
+  - Taxonomy Level 2
+- Normalizes friendly market labels such as Phoenix, AZ -> Phoenix.
+- Hard-verifies every parsed listing's pickup city/state before displaying it.
+- Phoenix accepts Phoenix/Mesa Arizona pickup inventory.
+- Mesa accepts Mesa/Phoenix Arizona pickup inventory.
+- Las Vegas accepts Las Vegas/North Las Vegas/Henderson Nevada inventory.
+- Philadelphia accepts Philadelphia Pennsylvania inventory.
+- Explicit wrong-state listings are always rejected.
+- No Chromium/Selenium is used in the active scan path.
+- Designed to stay compatible with Render Free during testing.
 
-v4.3:
-- Uses normal HTTP requests instead of launching Chromium.
-- Keeps the FlipScout UI, deal settings, profit analysis, and results workflow.
-- Has bounded network timeouts.
-- Runs on Render's Free plan for testing.
-- Does not include the broken expand/full-screen feature.
-
-Important:
-Nellis may serve some inventory dynamically. If its public search HTML does not expose listing URLs to ordinary HTTP requests, FlipScout will report zero links rather than crash the server. That result will tell us whether the next step should use Nellis's underlying public data requests/API instead.
-
-
-## v4.3 fix
-Removed the remaining unconditional Selenium import that prevented the lightweight Render build from starting.
+Upload all files over the existing GitHub files and commit to main. Auto-Deploy should deploy v4.4 automatically.
