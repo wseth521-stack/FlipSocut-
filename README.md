@@ -1,21 +1,30 @@
-# FlipScout AI Web v4.7 — Market Cluster Edition
+# FlipScout AI Web v4.8 — Exact Pickup Locations
 
-v4.7 changes location handling from single cities to Nellis market clusters.
+v4.8 separates individual Nellis pickup locations instead of combining nearby warehouses into one market choice.
 
-Market selector:
-- Arizona (Phoenix + Mesa)
-- Nevada (Las Vegas + North Las Vegas + Henderson)
-- Houston Area (Houston + Katy)
-- Dallas / Fort Worth (Dallas + Fort Worth + Arlington + Irving)
+Pickup selector includes:
+- Phoenix, AZ
+- Mesa, AZ
+- Las Vegas, NV
+- North Las Vegas, NV
+- Henderson, NV
+- Houston, TX
+- Katy, TX
+- Dallas, TX
+- Fort Worth, TX
+- Arlington, TX
+- Irving, TX
 - Philadelphia, PA
-- Denver, CO (Denver + Aurora)
+- Denver, CO
+- Aurora, CO
 
-Changes:
-- Accepts legitimate multiple pickup cities within one selected market.
-- Rejects explicit wrong-state listings.
-- Parses location evidence from pickup city, state, shopping location, and pickup address.
-- Expands sitemap discovery from roughly hundreds of candidates to as many as 2,500.
-- Can inspect up to 2,200 candidate listing pages while looking for verified listings in the selected market.
-- Keeps the lightweight HTTP-only scanner so Render Free does not need Chromium.
-- Keeps category, subcategory, condition, bid range, minimum profit, resale estimates, max bid, and deal scoring.
-- Footer updated to v4.7.
+Behavior:
+- Selecting Phoenix only accepts Phoenix pickup listings.
+- Selecting Mesa only accepts Mesa pickup listings.
+- The same exact-pickup rule applies to Nevada, Texas, Colorado, and other multi-pickup markets.
+- Wrong pickup cities and wrong states are rejected.
+- Category placeholder now reads "Example: Electronics".
+- Subcategory placeholder now reads "Example: Computers, Laptops, Tablets & Accessories".
+- Placeholder examples disappear naturally when the user types and do not count as filters.
+- Lightweight HTTP-only scan remains in place for Render Free testing.
+- Footer updated to v4.8.
