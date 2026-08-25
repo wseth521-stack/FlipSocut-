@@ -9,7 +9,8 @@ import requests
 try:
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options as ChromeOptions
-    from selenium.common.exceptions import WebDriverException
+    from selenium.webdriver.chrome.service import Service as ChromeService
+    from selenium.common.exceptions import WebDriverException, TimeoutException
 except Exception:
     webdriver = None
     ChromeOptions = None
@@ -2301,21 +2302,36 @@ def scan_current_nellis_browser(driver, max_links=200, progress_callback=None):
 from selenium.webdriver.common.by import By
 
 def start_server_browser():
-    """Start hidden Chrome for cloud/server deployment."""
+    """Start hidden Chromium reliably on Render/Docker."""
     if webdriver is None:
         raise RuntimeError("Selenium is not installed.")
 
     options = ChromeOptions()
+    options.binary_location = "/usr/bin/chromium"
     options.add_argument("--headless=new")
-    options.add_argument("--window-size=1600,1200")
+    options.add_argument("--window-size=1400,1000")
     options.add_argument("--disable-gpu")
     options.add_argument("--disable-notifications")
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-background-networking")
+    options.add_argument("--disable-default-apps")
+    options.add_argument("--disable-sync")
+    options.add_argument("--metrics-recording-only")
+    options.add_argument("--mute-audio")
+    options.add_argument("--no-first-run")
+    options.add_argument("--remote-debugging-port=9222")
+    options.add_argument("--single-process")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
-    return webdriver.Chrome(options=options)
+
+    service = ChromeService(executable_path="/usr/bin/chromedriver")
+    driver = webdriver.Chrome(service=service, options=options)
+    driver.set_page_load_timeout(25)
+    driver.set_script_timeout(15)
+    return driver
 
 
 def _click_text(driver, text):
@@ -2355,67 +2371,83 @@ def apply_nellis_filter(driver, label, value):
     return ok
 
 
-def scan_nellis_web(location, category="", subcategory="", star_rating="", max_links=100, progress_callback=None):
+def scan_nellis_web(location, category="", subcategory="", star_rating="", max_links=100,
+                    progress_callback=None, status_callback=None):
     """
-    Server-side scan:
-    1) open Nellis search in hidden Chrome
-    2) select market + requested filters inside the rendered Nellis UI
-    3) collect only rendered listing links
-    4) open listing pages in the same session
+    Server-side Nellis scan with bounded waits and stage reporting.
     """
-    driver = start_server_browser()
-    try:
-        driver.get("https://www.nellisauction.com/search")
-        time.sleep(2.2)
+    def status(msg):
+        if status_callback:
+            status_callback(msg)
 
-        # Location is required.
+    driver = None
+    try:
+        status("Starting server browser…")
+        driver = start_server_browser()
+
+        status("Opening Nellis…")
+        try:
+            driver.get("https://www.nellisauction.com/search")
+        except TimeoutException:
+            # A timeout can still leave a usable partially-rendered page.
+            status("Nellis took too long to fully load; continuing with rendered content…")
+        time.sleep(2.0)
+
+        status(f"Selecting location: {location}…")
         if location:
             apply_nellis_filter(driver, "Location", location)
-            time.sleep(1.2)
+            time.sleep(1.0)
 
         if category:
+            status(f"Applying category: {category}…")
             apply_nellis_filter(driver, "Category", category)
             time.sleep(0.7)
 
         if subcategory:
+            status(f"Applying subcategory: {subcategory}…")
             apply_nellis_filter(driver, "", subcategory)
             time.sleep(0.7)
 
         if star_rating:
-            # Common Nellis labels may render as "5 Stars", "5.0", etc.
+            status(f"Applying condition: {star_rating}…")
             attempted = [
                 str(star_rating),
                 f"{str(star_rating).replace('.0','')} Stars",
                 f"{str(star_rating).replace('.0','')} Star",
             ]
-            done = False
             _click_text(driver, "Condition")
-            time.sleep(0.3)
+            time.sleep(0.35)
             for candidate in attempted:
                 if _click_text(driver, candidate):
-                    done = True
                     break
             time.sleep(0.8)
 
-        # Let SPA settle and lazy-load cards.
-        try:
-            driver.refresh()
-            time.sleep(1.8)
-        except Exception:
-            pass
-
+        status("Reading rendered Nellis results…")
         scan_location = detect_nellis_location_from_browser(driver) or location
         links = browser_current_filtered_links(driver, max_links=int(max_links))
 
+        if not links:
+            # One extra bounded wait before giving up.
+            time.sleep(2.0)
+            links = browser_current_filtered_links(driver, max_links=int(max_links))
+
         rows, ended, errors = [], [], []
         total = len(links)
+
         if progress_callback:
             progress_callback(0, total, scan_location)
 
+        status(f"Found {total} listing links. Reading item details…")
+
         for i, u in enumerate(links, 1):
             try:
-                driver.get(u)
-                time.sleep(0.18)
+                try:
+                    driver.get(u)
+                except TimeoutException:
+                    pass
+
+                time.sleep(0.12)
+
                 try:
                     visible_text = driver.execute_script(
                         "return document.body ? document.body.innerText : '';"
@@ -2432,12 +2464,14 @@ def scan_nellis_web(location, category="", subcategory="", star_rating="", max_l
                     rows.append(row)
                 else:
                     ended.append(row)
+
             except Exception as e:
-                errors.append({"itemUrl": u, "error": str(e)[:140]})
+                errors.append({"itemUrl": u, "error": str(e)[:160]})
 
             if progress_callback:
                 progress_callback(i, total, scan_location)
 
+        status("Finishing deal analysis…")
         return {
             "rows": rows,
             "ended": ended,
@@ -2445,12 +2479,13 @@ def scan_nellis_web(location, category="", subcategory="", star_rating="", max_l
             "links_found": total,
             "scan_location": scan_location,
         }
-    finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
 
+    finally:
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                pass
 
 # ---------- FlipScout Web v4.0 UI ----------
 st.set_page_config(
@@ -2545,8 +2580,12 @@ if scan:
     if not location.strip():
         st.error("Enter a Nellis location first.")
     else:
-        progress = st.progress(0, text="Opening Nellis on the server…")
+        progress = st.progress(0, text="Preparing web scan…")
         progress_text = st.empty()
+        scan_status = st.info("Starting server browser…")
+
+        def _status(message):
+            scan_status.info(message)
 
         def _progress(done, total, loc):
             pct = 0 if total <= 0 else min(100, int(round(done / total * 100)))
@@ -2561,11 +2600,13 @@ if scan:
                 star_rating="" if star_rating == "Any" else star_rating,
                 max_links=int(max_links),
                 progress_callback=_progress,
+                status_callback=_status,
             )
         except Exception as e:
             st.error(f"Web scan could not complete: {e}")
             st.stop()
 
+        scan_status.success("Nellis scan finished.")
         progress.progress(100, text="Scan complete — 100%")
         progress_text.caption(f"{result['links_found']} listings checked")
 
@@ -2717,4 +2758,4 @@ if scan:
                     )
 
 st.divider()
-st.caption("FlipScout AI Web v4.0")
+st.caption("FlipScout AI Web v4.1")
