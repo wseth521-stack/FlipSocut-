@@ -560,10 +560,6 @@ div.stButton>button{border-radius:10px;font-weight:700;min-height:44px}
 div[data-testid="stDataFrame"]{border-radius:14px;overflow:hidden;border:1px solid rgba(255,255,255,.08)}
 .fs-footer{opacity:.58;font-size:.85rem;text-align:center;padding-top:.4rem}
 </style>
-<div class="fs-hero">
-  <div class="fs-title">🔥 FlipScout AI</div>
-  <div class="fs-sub">Find profitable Nellis Auction flips using your exact location and filters, with bid guidance, resale estimates, projected profit, and deal scoring.</div>
-</div>
 """, unsafe_allow_html=True)
 
 
@@ -2581,6 +2577,36 @@ def listing_matches_selected_market(row, location):
     return False
 
 
+def _nellis_market_url_candidates(location, category="", subcategory="", star_rating=""):
+    """Try Nellis market URL forms defensively; Nellis has changed market routing over time."""
+    from urllib.parse import urlencode
+    market_name, state, _ = normalize_nellis_market(location)
+    full = f"{market_name}, {state}" if state else market_name
+    base_filters = []
+    if star_rating:
+        rating = str(star_rating).replace(" Stars", "").replace(" Star", "").strip()
+        if rating and rating.lower() != "any":
+            base_filters.append(("Star Rating", rating if "." in rating else rating + ".0"))
+    if category:
+        base_filters.append(("Taxonomy Level 1", category))
+    if subcategory:
+        base_filters.append(("Taxonomy Level 2", subcategory))
+
+    variants = [
+        [("Location Name", full)],
+        [("Location Name", market_name)],
+        [("location", full)],
+        [("Location", full)],
+        [("market", full)],
+    ]
+    urls=[]
+    for loc_params in variants:
+        u="https://www.nellisauction.com/search?" + urlencode(loc_params + base_filters)
+        if u not in urls:
+            urls.append(u)
+    return urls
+
+
 def scan_nellis_lightweight(location, category="", subcategory="", star_rating="", max_links=100,
                              progress_callback=None, status_callback=None):
     """Low-memory scanner: HTTP only. No Chromium/Selenium process."""
@@ -2597,20 +2623,35 @@ def scan_nellis_lightweight(location, category="", subcategory="", star_rating="
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     })
 
-    search_url = _nellis_search_url(location, category, subcategory, star_rating)
     status(f"Loading filtered Nellis inventory for {location}…")
-    resp = session.get(search_url, timeout=(8, 20))
-    resp.raise_for_status()
-    html = resp.text
+    # Nellis can route the market through URL state and/or cookies. Seed both, then
+    # try several known URL forms. The hard item-page location gate below remains
+    # authoritative, so a wrong-market response can never leak into results.
+    market_name, market_state, _ = normalize_nellis_market(location)
+    full_market = f"{market_name}, {market_state}" if market_state else market_name
+    for ck in ("location", "selectedLocation", "market", "selectedMarket"):
+        session.cookies.set(ck, full_market, domain=".nellisauction.com")
 
-    # Extract product URLs from server-rendered HTML / embedded JSON.
+    html_pages=[]
+    for search_url in _nellis_market_url_candidates(location, category, subcategory, star_rating):
+        try:
+            resp = session.get(search_url, timeout=(8, 20))
+            if resp.ok and resp.text:
+                html_pages.append(resp.text)
+        except requests.RequestException:
+            continue
+    if not html_pages:
+        raise RuntimeError("Nellis did not return a search page for the selected market.")
+
+    # Extract product URLs from all candidate market responses.
     patterns = [
         r'https://www\.nellisauction\.com/p/[^"\'<>\s\\]+',
         r'href=["\'](/p/[^"\']+)["\']',
         r'["\'](?:itemUrl|url)["\']\s*:\s*["\']([^"\']*/p/[^"\']+)["\']',
     ]
     found = []
-    for pat in patterns:
+    for html in html_pages:
+      for pat in patterns:
         for m in re.findall(pat, html, flags=re.I):
             u = m if isinstance(m, str) else m[0]
             u = u.replace("\\u0026", "&").replace("\\/", "/")

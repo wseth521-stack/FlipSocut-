@@ -1,4 +1,4 @@
-# FlipScout AI Web v4.4 — Location Authority Fix
+# FlipScout AI Web v4.5 — Location Authority Fix
 
 This version keeps the lightweight Render-safe scanner and fixes cross-market inventory.
 
@@ -18,4 +18,4 @@ Changes:
 - No Chromium/Selenium is used in the active scan path.
 - Designed to stay compatible with Render Free during testing.
 
-Upload all files over the existing GitHub files and commit to main. Auto-Deploy should deploy v4.4 automatically.
+Upload all files over the existing GitHub files and commit to main. Auto-Deploy should deploy v4.5 automatically.
