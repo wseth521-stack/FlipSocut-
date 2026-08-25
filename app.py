@@ -2839,7 +2839,7 @@ def discover_algolia_product_links(session, max_links=100, status_callback=None)
         if status_callback:
             status_callback(msg)
 
-    status("Connecting to Nellis inventory search…")
+    status("Connecting to Nellis…")
     cfg = discover_nellis_algolia_config(session)
 
     viable = None
@@ -2889,10 +2889,294 @@ def discover_algolia_product_links(session, max_links=100, status_callback=None)
 
     return {"links": links, "index_name": index_name, "nb_hits": nb_hits}
 
+
+def start_production_browser():
+    """Start headless Chromium for Render/Railway Docker production."""
+    if webdriver is None:
+        raise RuntimeError("Selenium is not installed on the server.")
+
+    options = ChromeOptions()
+    options.binary_location = "/usr/bin/chromium"
+    for arg in [
+        "--headless=new",
+        "--window-size=1600,1200",
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-extensions",
+        "--disable-notifications",
+        "--disable-background-networking",
+        "--disable-default-apps",
+        "--disable-sync",
+        "--no-first-run",
+        "--mute-audio",
+        "--disable-blink-features=AutomationControlled",
+    ]:
+        options.add_argument(arg)
+
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+
+    service = ChromeService(executable_path="/usr/bin/chromedriver")
+    driver = webdriver.Chrome(service=service, options=options)
+    driver.set_page_load_timeout(35)
+    driver.set_script_timeout(20)
+    return driver
+
+
+def _click_rendered_text(driver, target):
+    """Best-effort click on rendered Nellis text/control."""
+    if not target:
+        return False
+
+    js = r"""
+    const wanted = arguments[0].trim().toLowerCase();
+    const els = [...document.querySelectorAll(
+      'button,a,label,span,div,[role="button"],[role="option"],[role="menuitem"],input'
+    )];
+
+    function txt(e) {
+      return ((e.innerText || e.textContent || e.value || '') + '').trim().toLowerCase();
+    }
+
+    const exact = els.find(e => txt(e) === wanted);
+    if (exact) {
+      exact.scrollIntoView({block:'center'});
+      exact.click();
+      return true;
+    }
+
+    const partial = els.find(e => txt(e).includes(wanted));
+    if (partial) {
+      partial.scrollIntoView({block:'center'});
+      partial.click();
+      return true;
+    }
+
+    return false;
+    """
+    try:
+        return bool(driver.execute_script(js, str(target)))
+    except Exception:
+        return False
+
+
+def _wait_for_nellis_refresh(driver, seconds=1.8):
+    import time
+    time.sleep(seconds)
+    try:
+        driver.execute_script("window.scrollTo(0, Math.min(document.body.scrollHeight, 1200));")
+    except Exception:
+        pass
+    time.sleep(0.4)
+
+
+def apply_exact_pickup_filter(driver, pickup_location):
+    """
+    Select the exact pickup location in Nellis's rendered UI.
+    Uses the visible city text from FlipScout's pickup selector.
+    """
+    city = str(pickup_location or "").split(",")[0].strip()
+    if not city:
+        return False
+
+    # Open a likely location selector first.
+    for label in ["Location", "Pickup Location", "Pickup", "Market"]:
+        if _click_rendered_text(driver, label):
+            _wait_for_nellis_refresh(driver, 0.5)
+            break
+
+    # Prefer exact city text.
+    ok = _click_rendered_text(driver, city)
+    if not ok:
+        ok = _click_rendered_text(driver, pickup_location)
+
+    _wait_for_nellis_refresh(driver, 1.5)
+    return ok
+
+
+def apply_optional_nellis_filters(driver, category="", subcategory="", star_rating=""):
+    if star_rating and str(star_rating).lower() != "any":
+        # Try multiple likely condition filter labels.
+        for opener in ["Condition", "Star Rating", "Rating"]:
+            if _click_rendered_text(driver, opener):
+                _wait_for_nellis_refresh(driver, 0.35)
+                break
+
+        targets = [
+            str(star_rating),
+            str(star_rating).replace(" Stars", " Star"),
+            str(star_rating).split()[0],
+        ]
+        for t in targets:
+            if _click_rendered_text(driver, t):
+                break
+        _wait_for_nellis_refresh(driver, 0.8)
+
+    if category:
+        for opener in ["Category", "Categories"]:
+            if _click_rendered_text(driver, opener):
+                _wait_for_nellis_refresh(driver, 0.35)
+                break
+        _click_rendered_text(driver, category)
+        _wait_for_nellis_refresh(driver, 0.8)
+
+    if subcategory:
+        _click_rendered_text(driver, subcategory)
+        _wait_for_nellis_refresh(driver, 0.8)
+
+
+def collect_rendered_product_links(driver, max_links=100):
+    """Collect product links from the currently rendered filtered Nellis search page."""
+    links = []
+    attempts = 0
+
+    while len(links) < int(max_links) and attempts < 10:
+        attempts += 1
+        try:
+            found = driver.execute_script(r"""
+                return [...document.querySelectorAll('a[href*="/p/"]')]
+                  .map(a => a.href)
+                  .filter(Boolean);
+            """) or []
+        except Exception:
+            found = []
+
+        for u in found:
+            if u.startswith("https://www.nellisauction.com/p/") and u not in links:
+                links.append(u)
+                if len(links) >= int(max_links):
+                    break
+
+        try:
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        except Exception:
+            pass
+        _wait_for_nellis_refresh(driver, 0.55)
+
+    return links[:int(max_links)]
+
+
+def scan_nellis_production(location, category="", subcategory="", star_rating="", max_links=100,
+                           progress_callback=None, status_callback=None):
+    """
+    Production scanner:
+    - Real rendered Chromium session
+    - Select exact pickup location
+    - Apply Nellis filters in the UI
+    - Collect links only from that rendered filtered page
+    - Verify exact pickup on every product page before showing it
+    """
+    import time
+
+    def status(msg):
+        if status_callback:
+            status_callback(msg)
+
+    driver = None
+    rows, ended, errors = [], [], []
+
+    try:
+        status("Starting secure Nellis browser session…")
+        driver = start_production_browser()
+
+        status("Opening Nellis inventory…")
+        try:
+            driver.get("https://www.nellisauction.com/search")
+        except TimeoutException:
+            pass
+        _wait_for_nellis_refresh(driver, 2.0)
+
+        status(f"Selecting pickup location: {location}…")
+        apply_exact_pickup_filter(driver, location)
+
+        if star_rating and str(star_rating).lower() != "any":
+            status(f"Applying condition filter: {star_rating}…")
+        elif category or subcategory:
+            status("Applying Nellis filters…")
+
+        apply_optional_nellis_filters(
+            driver,
+            category=category,
+            subcategory=subcategory,
+            star_rating=star_rating
+        )
+
+        status("Reading filtered Nellis results…")
+        links = collect_rendered_product_links(driver, max_links=int(max_links))
+
+        total = len(links)
+        if progress_callback:
+            progress_callback(0, max(1, total), location)
+
+        if not links:
+            return {
+                "rows": [],
+                "ended": [],
+                "errors": [],
+                "links_found": 0,
+                "scan_location": location,
+            }
+
+        status(f"Verifying {total} filtered listings…")
+
+        for i, u in enumerate(links, 1):
+            try:
+                try:
+                    driver.get(u)
+                except TimeoutException:
+                    pass
+                time.sleep(0.15)
+
+                try:
+                    visible_text = driver.execute_script(
+                        "return document.body ? document.body.innerText : '';"
+                    ) or ""
+                except Exception:
+                    visible_text = ""
+
+                row = _parse_nellis_page_source(
+                    u,
+                    driver.page_source,
+                    visible_text=visible_text
+                )
+                row["scanLocation"] = location
+
+                # Exact pickup remains authoritative.
+                if not listing_matches_selected_market(row, location):
+                    continue
+
+                if listing_is_active(row):
+                    rows.append(row)
+                else:
+                    ended.append(row)
+
+            except Exception as e:
+                errors.append({"itemUrl": u, "error": str(e)[:180]})
+
+            if progress_callback:
+                progress_callback(i, total, location)
+
+        status("Analyzing profitable opportunities…")
+        return {
+            "rows": rows,
+            "ended": ended,
+            "errors": errors,
+            "links_found": total,
+            "scan_location": location,
+        }
+
+    finally:
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
 def scan_nellis_lightweight(location, category="", subcategory="", star_rating="", max_links=100,
                              progress_callback=None, status_callback=None):
     """
-    v4.9: Nellis search-index discovery + exact pickup verification.
+    v5.0: Nellis search-index discovery + exact pickup verification.
     No browser process is launched.
     """
     def status(msg):
@@ -3020,7 +3304,7 @@ min_profit = st.sidebar.number_input(
 )
 
 st.markdown("## Choose Nellis Inventory")
-st.caption("Choose the exact Nellis pickup location. FlipScout searches Nellis inventory first, then verifies each listing's pickup city.")
+st.caption("Choose the exact Nellis pickup location and filters. FlipScout scans Nellis in a secure server browser and verifies every result before showing it.")
 
 c1, c2 = st.columns(2)
 with c1:
@@ -3050,7 +3334,7 @@ with c4:
     )
 
 with st.expander("Advanced scan settings"):
-    st.caption("v4.9 discovers inventory from Nellis's search index and then verifies the exact pickup location.")
+    st.caption("v5.0 discovers inventory from Nellis's search index and then verifies the exact pickup location.")
     max_links = st.number_input(
         "Maximum listings to inspect",
         min_value=10,
@@ -3065,7 +3349,7 @@ if scan:
     if not location.strip():
         st.error("Enter a Nellis location first.")
     else:
-        progress = st.progress(0, text="Preparing web scan…")
+        progress = st.progress(0, text="Preparing Nellis scan…")
         progress_text = st.empty()
         scan_status = st.info("Starting server browser…")
 
@@ -3078,7 +3362,7 @@ if scan:
             progress_text.caption(f"{done} of {total} listings checked")
 
         try:
-            result = scan_nellis_lightweight(
+            result = scan_nellis_production(
                 location=location.strip(),
                 category=category.strip(),
                 subcategory=subcategory.strip(),
@@ -3244,4 +3528,4 @@ if scan:
                     )
 
 st.divider()
-st.caption("FlipScout AI Web v4.9")
+st.caption("FlipScout AI Web v5.0")

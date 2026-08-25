@@ -2,7 +2,7 @@ services:
   - type: web
     name: flipscout-ai
     runtime: docker
-    plan: free
+    plan: standard
     healthCheckPath: /
     envVars:
       - key: PORT
