@@ -2299,7 +2299,6 @@ def scan_current_nellis_browser(driver, max_links=200, progress_callback=None):
 
 
 # ---------- FlipScout Web v4.0: server-side Nellis scanner ----------
-from selenium.webdriver.common.by import By
 
 def start_server_browser():
     """Start hidden Chromium reliably on Render/Docker."""
@@ -2627,7 +2626,7 @@ min_profit = st.sidebar.number_input(
 )
 
 st.markdown("## Choose Nellis Inventory")
-st.caption("FlipScout scans Nellis in a hidden server browser. Customers do not need Python, Selenium, or a separate scanner window.")
+st.caption("FlipScout uses a lightweight web scan designed for low-memory hosting. No local Python or browser extension is required.")
 
 c1, c2 = st.columns(2)
 with c1:
