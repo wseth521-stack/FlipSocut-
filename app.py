@@ -2485,32 +2485,56 @@ def scan_nellis_web(location, category="", subcategory="", star_rating="", max_l
 
 def normalize_nellis_market(location):
     """
-    Convert friendly location labels to the value Nellis uses in its URL.
+    Current Nellis shopping markets and accepted pickup-city clusters.
     Returns (market_name_for_url, expected_state, accepted_pickup_cities).
     """
     raw = (location or "").strip()
     key = raw.lower()
 
     markets = {
+        # Arizona market
         "phoenix": ("Phoenix", "AZ", {"phoenix", "mesa"}),
         "phoenix, az": ("Phoenix", "AZ", {"phoenix", "mesa"}),
-        "mesa": ("Mesa", "AZ", {"mesa", "phoenix"}),
-        "mesa, az": ("Mesa", "AZ", {"mesa", "phoenix"}),
+        "mesa": ("Phoenix", "AZ", {"phoenix", "mesa"}),
+        "mesa, az": ("Phoenix", "AZ", {"phoenix", "mesa"}),
+
+        # Nevada market
         "las vegas": ("Las Vegas", "NV", {"las vegas", "north las vegas", "henderson"}),
         "las vegas, nv": ("Las Vegas", "NV", {"las vegas", "north las vegas", "henderson"}),
+
+        # Texas markets
+        "houston": ("Houston", "TX", {"houston", "katy"}),
+        "houston, tx": ("Houston", "TX", {"houston", "katy"}),
+        "dallas": ("Dallas", "TX", {"dallas"}),
+        "dallas, tx": ("Dallas", "TX", {"dallas"}),
+
+        # Pennsylvania market
         "philadelphia": ("Philadelphia", "PA", {"philadelphia"}),
         "philadelphia, pa": ("Philadelphia", "PA", {"philadelphia"}),
+
+        # Colorado market
+        "denver": ("Denver", "CO", {"denver"}),
+        "denver, co": ("Denver", "CO", {"denver"}),
     }
 
     if key in markets:
         return markets[key]
 
-    # Generic fallback for future Nellis markets.
     if "," in raw:
         city, state = [x.strip() for x in raw.rsplit(",", 1)]
         return city, state.upper(), {city.lower()}
+
     return raw, "", {raw.lower()} if raw else set()
 
+
+NELLIS_MARKET_OPTIONS = [
+    "Phoenix, AZ",
+    "Las Vegas, NV",
+    "Houston, TX",
+    "Philadelphia, PA",
+    "Denver, CO",
+    "Dallas, TX",
+]
 
 def _nellis_search_url(location, category="", subcategory="", star_rating=""):
     """Build the same style of search URL Nellis produces in the browser."""
@@ -2607,14 +2631,109 @@ def _nellis_market_url_candidates(location, category="", subcategory="", star_ra
     return urls
 
 
+
+def discover_product_links_from_sitemaps(session, max_candidates=500):
+    """
+    Lightweight fallback that discovers Nellis product URLs from sitemap/robots
+    without launching a browser. This avoids being locked to the default Vegas search page.
+    """
+    from urllib.parse import urljoin
+    import xml.etree.ElementTree as ET
+
+    sitemap_urls = []
+    product_urls = []
+
+    # Try robots.txt first because it may list sitemap indexes.
+    try:
+        rr = session.get("https://www.nellisauction.com/robots.txt", timeout=(5, 12))
+        if rr.ok:
+            for line in rr.text.splitlines():
+                if line.lower().startswith("sitemap:"):
+                    sitemap_urls.append(line.split(":", 1)[1].strip())
+    except Exception:
+        pass
+
+    for guess in [
+        "https://www.nellisauction.com/sitemap.xml",
+        "https://www.nellisauction.com/sitemap_index.xml",
+    ]:
+        if guess not in sitemap_urls:
+            sitemap_urls.append(guess)
+
+    seen_sitemaps = set()
+    queue = list(sitemap_urls)
+
+    while queue and len(seen_sitemaps) < 15 and len(product_urls) < max_candidates:
+        sm = queue.pop(0)
+        if sm in seen_sitemaps:
+            continue
+        seen_sitemaps.add(sm)
+
+        try:
+            r = session.get(sm, timeout=(5, 15))
+            if not r.ok or "<" not in r.text:
+                continue
+            root = ET.fromstring(r.content)
+        except Exception:
+            continue
+
+        locs = []
+        for elem in root.iter():
+            if elem.tag.lower().endswith("loc") and elem.text:
+                locs.append(elem.text.strip())
+
+        for u in locs:
+            if "/p/" in u:
+                if u not in product_urls:
+                    product_urls.append(u)
+                    if len(product_urls) >= max_candidates:
+                        break
+            elif "sitemap" in u.lower() and u not in seen_sitemaps and len(queue) < 30:
+                queue.append(u)
+
+    # Newer sitemap entries tend to appear later.
+    return list(reversed(product_urls))[:max_candidates]
+
+
+def row_matches_requested_filters(row, category="", subcategory="", star_rating=""):
+    """Apply category/subcategory/star filters using parsed listing text."""
+    cat = str(row.get("category") or row.get("foundIn") or "").lower()
+    title = str(row.get("title") or "").lower()
+    cond = str(row.get("condition") or row.get("quality") or "").lower()
+
+    if category:
+        wanted = category.strip().lower()
+        if wanted not in cat and wanted not in title:
+            return False
+
+    if subcategory:
+        wanted = subcategory.strip().lower()
+        if wanted not in cat and wanted not in title:
+            return False
+
+    if star_rating and str(star_rating).lower() != "any":
+        wanted_num = re.search(r"\d", str(star_rating))
+        if wanted_num:
+            n = wanted_num.group(0)
+            # Accept explicit "5 Stars"/"5 Star" parsed condition labels only.
+            if n not in cond or "star" not in cond:
+                return False
+
+    return True
+
 def scan_nellis_lightweight(location, category="", subcategory="", star_rating="", max_links=100,
                              progress_callback=None, status_callback=None):
-    """Low-memory scanner: HTTP only. No Chromium/Selenium process."""
+    """
+    Render-free multi-market scan:
+    1) Try Nellis search HTML first.
+    2) Hard-verify pickup market.
+    3) If the search page falls back to the wrong/default market, discover product
+       URLs from Nellis sitemaps and stop when enough verified listings are found.
+    """
     def status(msg):
         if status_callback:
             status_callback(msg)
 
-    status("Connecting to Nellis without launching Chrome…")
     session = requests.Session()
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -2623,83 +2742,109 @@ def scan_nellis_lightweight(location, category="", subcategory="", star_rating="
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     })
 
-    status(f"Loading filtered Nellis inventory for {location}…")
-    # Nellis can route the market through URL state and/or cookies. Seed both, then
-    # try several known URL forms. The hard item-page location gate below remains
-    # authoritative, so a wrong-market response can never leak into results.
-    market_name, market_state, _ = normalize_nellis_market(location)
-    full_market = f"{market_name}, {market_state}" if market_state else market_name
-    for ck in ("location", "selectedLocation", "market", "selectedMarket"):
-        session.cookies.set(ck, full_market, domain=".nellisauction.com")
+    search_url = _nellis_search_url(location, category, subcategory, star_rating)
+    status(f"Loading {location} inventory…")
 
-    html_pages=[]
-    for search_url in _nellis_market_url_candidates(location, category, subcategory, star_rating):
-        try:
-            resp = session.get(search_url, timeout=(8, 20))
-            if resp.ok and resp.text:
-                html_pages.append(resp.text)
-        except requests.RequestException:
-            continue
-    if not html_pages:
-        raise RuntimeError("Nellis did not return a search page for the selected market.")
+    direct_links = []
+    try:
+        resp = session.get(search_url, timeout=(8, 20))
+        resp.raise_for_status()
+        html = resp.text
 
-    # Extract product URLs from all candidate market responses.
-    patterns = [
-        r'https://www\.nellisauction\.com/p/[^"\'<>\s\\]+',
-        r'href=["\'](/p/[^"\']+)["\']',
-        r'["\'](?:itemUrl|url)["\']\s*:\s*["\']([^"\']*/p/[^"\']+)["\']',
-    ]
-    found = []
-    for html in html_pages:
-      for pat in patterns:
-        for m in re.findall(pat, html, flags=re.I):
-            u = m if isinstance(m, str) else m[0]
-            u = u.replace("\\u0026", "&").replace("\\/", "/")
-            if u.startswith("/"):
-                u = "https://www.nellisauction.com" + u
-            if u.startswith("https://www.nellisauction.com/p/") and u not in found:
-                found.append(u)
-            if len(found) >= int(max_links):
+        patterns = [
+            r'https://www\.nellisauction\.com/p/[^"\'<>\s\\]+',
+            r'href=["\'](/p/[^"\']+)["\']',
+            r'["\'](?:itemUrl|url)["\']\s*:\s*["\']([^"\']*/p/[^"\']+)["\']',
+        ]
+        for pat in patterns:
+            for m in re.findall(pat, html, flags=re.I):
+                u = m if isinstance(m, str) else m[0]
+                u = u.replace("\\u0026", "&").replace("\\/", "/")
+                if u.startswith("/"):
+                    u = "https://www.nellisauction.com" + u
+                if u.startswith("https://www.nellisauction.com/p/") and u not in direct_links:
+                    direct_links.append(u)
+                if len(direct_links) >= int(max_links):
+                    break
+            if len(direct_links) >= int(max_links):
                 break
-        if len(found) >= int(max_links):
-            break
+    except Exception:
+        pass
 
-    links = found[:int(max_links)]
-    total = len(links)
-    status(f"Found {total} listing links. Reading item details…")
-    if progress_callback:
-        progress_callback(0, total, location)
+    # Candidate pool begins with direct search results, then sitemap fallback.
+    candidates = list(direct_links)
+    status("Verifying pickup market…")
+
+    sitemap_candidates = []
+    if len(candidates) < int(max_links):
+        status("Finding more Nellis inventory across all markets…")
+        sitemap_candidates = discover_product_links_from_sitemaps(
+            session, max_candidates=max(500, int(max_links) * 5)
+        )
+        for u in sitemap_candidates:
+            if u not in candidates:
+                candidates.append(u)
 
     rows, ended, errors = [], [], []
-    for i, u in enumerate(links, 1):
+    checked = 0
+    target = int(max_links)
+    total_candidates = len(candidates)
+
+    if progress_callback:
+        progress_callback(0, max(1, min(total_candidates, target)), location)
+
+    for u in candidates:
+        if len(rows) >= target:
+            break
+
+        checked += 1
         try:
-            r = session.get(u, timeout=(6, 15))
+            r = session.get(u, timeout=(5, 12))
             r.raise_for_status()
+
             visible = re.sub(r"<script\b[^>]*>.*?</script>", " ", r.text, flags=re.I|re.S)
             visible = re.sub(r"<style\b[^>]*>.*?</style>", " ", visible, flags=re.I|re.S)
             visible = re.sub(r"<[^>]+>", " ", visible)
             visible = re.sub(r"\s+", " ", visible)
+
             row = _parse_nellis_page_source(u, r.text, visible_text=visible)
             row["scanLocation"] = location
 
             if not listing_matches_selected_market(row, location):
-                errors.append({
-                    "itemUrl": u,
-                    "error": f"Rejected wrong pickup market for selected location: {location}"
-                })
-            elif listing_is_active(row):
+                continue
+
+            if not row_matches_requested_filters(row, category, subcategory, star_rating):
+                continue
+
+            if listing_is_active(row):
                 rows.append(row)
             else:
                 ended.append(row)
+
         except Exception as e:
             errors.append({"itemUrl": u, "error": str(e)[:160]})
+
         if progress_callback:
-            progress_callback(i, total, location)
+            # Progress is based on verified matches when fallback candidate pool is large.
+            done = min(len(rows), target)
+            progress_callback(done, target, location)
+
+        # Keep free-host scans bounded.
+        if checked >= max(700, target * 7):
+            break
+
+    if progress_callback:
+        progress_callback(target if rows else 0, target, location)
 
     return {
-        "rows": rows, "ended": ended, "errors": errors,
-        "links_found": total, "scan_location": location,
+        "rows": rows,
+        "ended": ended,
+        "errors": errors,
+        "links_found": checked,
+        "scan_location": location,
         "search_url": search_url,
+        "direct_links_found": len(direct_links),
+        "fallback_links_found": len(sitemap_candidates),
     }
 
 # ---------- FlipScout Web v4.0 UI ----------
@@ -2752,14 +2897,15 @@ min_profit = st.sidebar.number_input(
 )
 
 st.markdown("## Choose Nellis Inventory")
-st.caption("FlipScout uses a lightweight web scan designed for low-memory hosting. No local Python or browser extension is required.")
+st.caption("Choose any Nellis market below. FlipScout verifies every listing's pickup location before showing it.")
 
 c1, c2 = st.columns(2)
 with c1:
-    location = st.text_input(
+    location = st.selectbox(
         "Nellis location",
-        value="Phoenix, AZ",
-        help="Enter the Nellis market exactly as it appears on Nellis, e.g. Phoenix, AZ; Mesa, AZ; Las Vegas, NV; Philadelphia, PA."
+        NELLIS_MARKET_OPTIONS,
+        index=0,
+        help="Choose the Nellis shopping market you want FlipScout to scan."
     )
 with c2:
     star_rating = st.selectbox(
@@ -2975,4 +3121,4 @@ if scan:
                     )
 
 st.divider()
-st.caption("FlipScout AI Web v4.4")
+st.caption("FlipScout AI Web v4.6")
